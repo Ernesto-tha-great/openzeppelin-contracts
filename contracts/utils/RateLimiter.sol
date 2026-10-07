@@ -61,9 +61,11 @@ library RateLimiter {
     /**
      * @dev The per-`key` state of a {RefillingBucket} entry.
      *
-     * `lastUsed` and `lastTimepoint` record the used quantity and the time it was recorded at the entry's last
-     * update. The current state is reconstructed lazily from these two fields on read (see {state}), keeping storage
-     * cost constant at one packed slot per entry regardless of how many times the entry has been consumed.
+     * `lastUsed` and `lastTimepoint` record the used quantity and the time from which refill accrues on it, as of the
+     * entry's last update. The current state is reconstructed lazily from these two fields on read (see {state}),
+     * keeping storage cost constant at one packed slot per entry regardless of how many times the entry has been
+     * consumed. When an entry is updated before it has fully refilled, `lastTimepoint` is only moved forward by the
+     * time it took to refill whole units, so that a partially refilled unit is carried over rather than discarded.
      *
      * WARNING: Manually updating any of the parameters may result in incorrect behavior. Only interact with the
      * {RefillingBucket} through the dedicated functions.
@@ -137,13 +139,38 @@ library RateLimiter {
         (uint256 used_, uint256 available_) = state(self, key);
         if (quantity <= available_) {
             self._items[key] = RefillingBucketItem({
-                _lastTimepoint: Time.timestamp(),
+                _lastTimepoint: _refillTimepoint(self, key, used_),
                 _lastUsed: SafeCast.toUint208(used_ + quantity)
             });
             return true;
         } else {
             return false;
         }
+    }
+
+    /**
+     * @dev Returns the timepoint from which refill accrues on `used_`, the current used quantity of the `key` bucket.
+     *
+     * If the bucket has fully refilled, this is the current timestamp. Otherwise, it is the entry's last timepoint
+     * moved forward by the time it took to refill the whole units already deducted from `used_`, rounded up. The
+     * fraction of a unit refilled during the remaining seconds keeps accruing instead of being discarded, which would
+     * otherwise lower the effective refill rate of a bucket that is consumed while partially refilled.
+     *
+     * Requires `used_` to be the value returned by {state-struct-RateLimiter-RefillingBucket-bytes32} for `key`.
+     */
+    function _refillTimepoint(RefillingBucket storage self, bytes32 key, uint256 used_) private view returns (uint48) {
+        if (used_ == 0) return Time.timestamp();
+
+        RefillingBucketItem storage item_ = self._items[key]; // cache
+
+        // `used_ > 0` means {state} did not saturate, so `refilled = floor(elapsed * capacity / window)`. Therefore
+        // `ceil(refilled * window / capacity) <= elapsed` and the result never exceeds the current timestamp. A
+        // non-zero `refilled` also implies a non-zero `capacity`.
+        uint256 refilled = item_._lastUsed - used_;
+        if (refilled == 0) return item_._lastTimepoint;
+        return
+            item_._lastTimepoint +
+            uint48(Math.mulDiv(refilled, Math.max(self._window, 1), self._capacity, Math.Rounding.Ceil));
     }
 
     /**

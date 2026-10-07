@@ -350,6 +350,64 @@ describe('RateLimiter', function () {
         await expect(this.mock.state()).to.not.be.revert(ethers);
       });
     });
+
+    describe('with a refill rate below one unit per second', function () {
+      const window = 3_600n;
+      const capacity = 10n; // one unit every 360 seconds
+
+      const tryConsumeOne = mock =>
+        mock
+          .tryConsume(1n)
+          .then(tx => tx.wait())
+          .then(({ logs }) => mock.interface.parseLog(logs[0]).args[0]);
+
+      beforeEach(async function () {
+        await this.mock.updateSettings(window, capacity);
+        await this.mock.consume(capacity); // empty the bucket
+      });
+
+      it('carries a partially refilled unit over when consuming', async function () {
+        // 540 seconds after the bucket was emptied, 1.5 units have refilled
+        await time.increaseBy.timestamp(540n, false);
+        await this.mock.consume(1n);
+
+        await expect(this.mock.state()).to.eventually.deep.equal([capacity, 0n]);
+
+        // 720 seconds after the bucket was emptied, 2 units have refilled, so one is available again
+        await time.increaseBy.timestamp(180n);
+
+        await expect(this.mock.state()).to.eventually.deep.equal([capacity - 1n, 1n]);
+      });
+
+      it('sustains the configured refill rate', async function () {
+        // try to consume one unit every 300 seconds, slightly faster than units refill
+        const attempts = 36n;
+        const delay = 300n;
+
+        let consumed = 0n;
+        for (let i = 0n; i < attempts; ++i) {
+          await time.increaseBy.timestamp(delay, false);
+          if (await tryConsumeOne(this.mock)) consumed++;
+        }
+
+        expect(consumed).to.equal(refill(attempts * delay, capacity, window));
+      });
+
+      it('never makes more available than refilled', async function () {
+        // exact model of the bucket, with the used quantity scaled by `window` to avoid rounding
+        let scaledUsed = capacity * window;
+
+        for (const delay of [1n, 7n, 59n, 300n, 361n, 1_000n, 13n, 719n, 2n, 360n, 3_599n, 4_000n, 5n]) {
+          await time.increaseBy.timestamp(delay, false);
+          scaledUsed = scaledUsed > delay * capacity ? scaledUsed - delay * capacity : 0n;
+
+          if (await tryConsumeOne(this.mock)) scaledUsed += window;
+
+          expect(scaledUsed).to.be.lte(capacity * window);
+          await expect(this.mock.available()).to.eventually.be.lte((capacity * window - scaledUsed) / window);
+        }
+      });
+    });
   });
 
   describe('SlidingWindow', function () {
